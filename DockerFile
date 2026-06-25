@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY src/ ./src/
+COPY tests/ ./tests/
+
+# No external deps — stdlib only, by design (proves no ORM/DB library is doing the work)
+RUN mkdir -p data
+
+ENTRYPOINT ["python", "-m", "src.repl"]
