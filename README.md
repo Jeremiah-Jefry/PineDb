@@ -1,18 +1,91 @@
-# PineDB
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/zero_dependencies-stdlib_only-2ea44f?style=for-the-badge" alt="Zero Dependencies" />
+  <img src="https://img.shields.io/badge/status-under_development-orange?style=for-the-badge" alt="Under Development" />
+  <img src="https://img.shields.io/badge/docker-ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker Ready" />
+</p>
 
-A disk-backed storage engine written in C, built from scratch to understand what a database actually does underneath. Implements a B+Tree index, write-ahead logging with crash recovery, atomic transactions, and a SQL subset — no libraries, no shortcuts.
+<h1 align="center">PineDB</h1>
 
-> Built to understand what Postgres does under the hood, specifically the indexing and durability guarantees most developers rely on without really knowing how they work.
+<p align="center">
+  <strong>A disk-backed relational storage engine built from scratch in Python.</strong><br/>
+  B+Tree indexing · Write-ahead logging · Crash recovery · Atomic transactions · SQL interface<br/>
+  <em>Zero external dependencies — stdlib only, by design.</em>
+</p>
+
+<p align="center">
+  <a href="#motivation">Motivation</a> •
+  <a href="#architecture">Architecture</a> •
+  <a href="#crash-recovery-demo">Crash Recovery Demo</a> •
+  <a href="#how-each-layer-works">Deep Dive</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#sql-subset">SQL Subset</a>
+</p>
 
 ---
 
-## The demo that matters
+## Motivation
 
-This is the one thing worth seeing before anything else. Insert records, violently kill the process mid-write, restart — data is intact:
+Most developers interact with databases through ORMs and query builders without understanding the systems-level guarantees they depend on — how an index avoids a full table scan, how `COMMIT` makes data survive a power failure, or why `ROLLBACK` can undo a series of writes atomically.
+
+PineDB exists to demystify those mechanisms. Every layer — page I/O, B+Tree indexing, write-ahead logging, transaction management, and SQL parsing — is implemented from first principles using only Python's standard library. No SQLite bindings, no embedded engines, no ORM magic. The constraint of zero dependencies is intentional: it proves that every behavior is understood and hand-built.
+
+> **The goal was never to build a production database.** It was to build the understanding required to read PostgreSQL's source code and follow what the WAL manager, buffer pool, and B+Tree implementation are actually doing.
+
+---
+
+## Architecture
+
+```
+                        ┌──────────────────────────────────┐
+                        │           SQL Parser             │
+                        │      (parser.py / executor.py)   │
+                        │  Tokenizer + recursive descent   │
+                        │  SELECT · INSERT · WHERE · CREATE│
+                        └───────────────┬──────────────────┘
+                                        │ AST
+                        ┌───────────────▼──────────────────┐
+                        │      Transaction Manager         │
+                        │            (txn.py)               │
+                        │   BEGIN · COMMIT · ROLLBACK      │
+                        │   Buffers writes until COMMIT    │
+                        └───────────────┬──────────────────┘
+                                        │
+                        ┌───────────────▼──────────────────┐
+                        │         B+Tree Index             │
+                        │        (bplustree.py)            │
+                        │  On-disk, integer keys           │
+                        │  Insert · Point search · Range   │
+                        └───────────────┬──────────────────┘
+                                        │
+                        ┌───────────────▼──────────────────┐
+                        │     Pager (Page I/O Layer)       │
+                        │          (pager.py)               │
+                        │  4096-byte fixed pages           │
+                        │  Direct file I/O · fsync         │
+                        └───────────────┬──────────────────┘
+                                        │
+                        ┌───────────────▼──────────────────┐
+                        │    WAL (Durability Layer)        │
+                        │          (wal.py)                 │
+                        │  Append-only log · fsync on      │
+                        │  commit · Crash recovery         │
+                        └───────────────┬──────────────────┘
+                                        │
+                                   data.db + data.wal
+```
+
+**The invariant every layer respects:** no modified page reaches `data.db` until its WAL record is flushed and fsynced first. That single rule is the foundation of crash recovery.
+
+---
+
+## Crash Recovery Demo
+
+This is the behavior that validates the entire project. Insert records, violently kill the process mid-write, restart — committed data is intact:
 
 ```bash
-# Start a write session
-./pinedb
+# Start PineDB
+python -m src.repl
 
 pinedb> BEGIN;
 pinedb> INSERT INTO users VALUES (1, 'alice');
@@ -20,265 +93,278 @@ pinedb> INSERT INTO users VALUES (2, 'bob');
 pinedb> INSERT INTO users VALUES (3, 'carol');
 pinedb> COMMIT;
 
-# In another terminal — kill the process hard, no cleanup
-kill -9 $(pgrep pinedb)
+# In another terminal — kill the process with no cleanup
+kill -9 $(pgrep -f "src.repl")
 
 # Restart
-./pinedb
+python -m src.repl
 
 # WAL recovery runs automatically on startup
 # [recovery] replaying 3 committed records from WAL...
 # [recovery] done.
 
 pinedb> SELECT * FROM users WHERE id = 2;
-2 | bob        ✓
+# → 2 | bob        ✓  (data survived the crash)
 ```
 
-This works because of write-ahead logging. The WAL guarantees that a committed transaction is never lost, even if the process is killed between writing pages and fsyncing them. See [How the WAL works](#how-the-wal-works) below.
+This works because the WAL guarantees that once `fsync` returns after writing the commit marker, the transaction's page images are on physical disk. Recovery replays them. See [How the WAL Works](#wal--crash-recovery) for the full protocol.
 
 ---
 
-## Architecture
+## Quick Start
 
-```
-┌─────────────────────────┐
-│      SQL Parser         │  tokenizer + recursive descent parser
-│  (parser.c / executor.c)│  SELECT / INSERT / WHERE / CREATE TABLE
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│   Transaction Manager   │  BEGIN / COMMIT / ROLLBACK
-│       (txn.c)           │  buffers writes until COMMIT
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│      B+Tree Index       │  on-disk, integer keys
-│    (bplustree.c)        │  insert, point search, range scan
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│    Pager (page cache)   │  4096-byte fixed pages, pread/pwrite
-│       (pager.c)         │  LRU cache, page allocation, free list
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│  WAL (durability layer) │  append-only log, fsync on commit
-│       (wal.c)           │  crash recovery on startup
-└─────────────────────────┘
-             │
-         data.db + data.wal
-```
-
-The rule every layer follows: **nothing writes to data.db until its WAL record is flushed first.** That single rule is write-ahead logging, and it's what makes crash recovery possible.
-
----
-
-## Quick start
-
-**Requirements:** GCC, Make, Linux or macOS (uses `pread`/`pwrite`/`fsync`).
+**Requirements:** Python 3.12+ (no external packages).
 
 ```bash
-git clone https://github.com/you/pinedb
-cd pinedb
-
-# Build
-make
+# Clone
+git clone https://github.com/Jeremiah-Jefry/PineDb.git
+cd PineDb
 
 # Run the REPL
-./pinedb
+python -m src.repl
 
-# Run all tests
-make test
+# Run tests
+python tests/test_pager.py
 ```
+
+### Docker
+
+```bash
+# Build
+docker build -t pinedb .
+
+# Run the REPL
+docker run -it pinedb
+
+# Run tests inside the container
+docker run --entrypoint python pinedb tests/test_pager.py
+```
+
+> **Zero dependencies is a deliberate design choice.** The `requirements.txt` is empty. Everything is built on Python's `struct`, `os`, and file I/O primitives. This proves no library is doing the heavy lifting.
 
 ---
 
-## SQL subset
+## SQL Subset
 
 ```sql
--- Create a table
+-- Schema definition
 CREATE TABLE users (id INT, name TEXT);
 
--- Insert a row
+-- Insert
 INSERT INTO users VALUES (1, 'alice');
 
--- Point lookup (uses B+Tree index — O(log n))
+-- Point lookup — uses B+Tree index, O(log n)
 SELECT * FROM users WHERE id = 1;
 
--- Range scan (walks leaf sibling pointers)
+-- Range scan — walks leaf sibling pointers
 SELECT * FROM users WHERE id > 100;
 
 -- Transactions
 BEGIN;
 INSERT INTO users VALUES (2, 'bob');
-ROLLBACK;   -- none of it persists
+ROLLBACK;    -- nothing persists
 
 BEGIN;
 INSERT INTO users VALUES (3, 'carol');
-COMMIT;     -- atomic, durable
+COMMIT;      -- atomic and durable
 ```
 
-Parser is a hand-written recursive descent parser — no yacc, no bison. It handles one WHERE condition at a time (no AND/OR chains).
+The parser is a hand-written recursive descent parser — no parser generators (`yacc`, `PLY`, `lark`). It handles a single `WHERE` condition per query. This was a conscious scope decision: the parser is the least systems-interesting component, so effort was invested in the storage and durability layers instead.
 
 ---
 
-## Project structure
+## How Each Layer Works
 
-```
-pinedb/
-├── src/
-│   ├── pager.c / pager.h       # disk I/O, page cache, free list
-│   ├── record.c / record.h     # row encode/decode to raw bytes
-│   ├── bplustree.c / .h        # on-disk B+Tree, insert, search, range scan
-│   ├── wal.c / wal.h           # write-ahead log, fsync, recovery
-│   ├── txn.c / txn.h           # BEGIN / COMMIT / ROLLBACK
-│   ├── parser.c / parser.h     # tokenizer + recursive descent parser
-│   ├── executor.c / executor.h # AST → B+Tree / txn calls
-│   └── main.c                  # REPL loop
-├── tests/
-│   ├── test_pager.c            # write N records, kill, reopen, verify
-│   ├── test_btree.c            # insert 50k keys, stress-test splits
-│   ├── test_wal_recovery.c     # the kill -9 demo, automated
-│   └── test_txn.c              # rollback leaves no trace
-├── data/                       # generated .db and .wal files (gitignored)
-├── docs/
-│   └── ARCHITECTURE.md         # deeper design notes
-├── Makefile
-└── README.md
-```
+### Pager — The Foundation
 
----
+Every component in PineDB reads and writes through the pager. Nothing touches the database file directly.
 
-## How each layer works
+The file is divided into fixed **4096-byte pages**, matching the typical OS page size. The pager provides four operations:
 
-### Pager — the foundation
-
-Every component reads and writes through the pager. Nothing touches the file directly.
-
-The file is divided into fixed 4096-byte pages (matching the OS page size). To read page N, the pager does:
-
-```c
-pread(fd, buf, PAGE_SIZE, pgno * PAGE_SIZE);
-```
-
-No seeking, no buffered stdio, just a direct positional read. The pager keeps a simple in-memory cache so repeated reads of the same page don't hit disk twice.
-
-Why `pread`/`pwrite` instead of `fread`/`fwrite`? Buffered stdio adds its own caching layer on top of the OS page cache, and you lose control over exactly when bytes reach disk. `pread`/`pwrite` are positional (no cursor to track) and map directly to kernel I/O.
+| Operation | Description |
+|---|---|
+| `allocate_page()` | Extends the file by one page, returns the new page number |
+| `read_page(pgno)` | Reads 4096 bytes at offset `pgno × 4096` |
+| `write_page(pgno, data)` | Writes a full page and calls `os.fsync()` |
+| `insert_record(bytes)` | Packs a record into the next available slot |
 
 **Page layout:**
 
 ```
-Byte 0..63    → PageHeader  (type, page_id, num_records, sibling pointer)
-Byte 64..4095 → data[]      (record slots, packed tightly)
+Byte 0..7       →  Page header (record count, metadata)
+Byte 8..4095    →  Record slots (packed contiguously)
 ```
 
-With 36 bytes per record (4-byte id + 32-byte name), one page holds 112 records. Record at slot `i` is always at `data + i * 36` — no searching required.
+With 36 bytes per record (`4-byte uint32 id` + `32-byte fixed-width name`), one page holds **113 records**. Record at slot `i` is always at `header_size + i × 36` — O(1) random access within a page.
+
+**Why `os.fsync()`?** Without it, the OS can buffer writes indefinitely in the page cache. `fsync` forces data to physical storage, which is the only way to guarantee durability across power failures. This is the same mechanism PostgreSQL relies on.
 
 ---
 
-### B+Tree — the index
+### Record Encoding
 
-The B+Tree is the reason point lookups are `O(log n)` instead of `O(n)`.
+Records use a fixed-width binary format via Python's `struct` module:
 
-Every key (integer) lives in the tree. Internal nodes hold `(key, child_page)` pairs and act as a routing table. Leaf nodes hold `(key, record)` pairs and are linked together in a chain — this is what makes range scans fast.
+```python
+RECORD_FORMAT = "<I32s"   # little-endian: 4-byte uint + 32-byte string
+RECORD_SIZE   = 36        # bytes
+```
 
-**Insert and split:** When a leaf overflows, it splits into two leaves and pushes the median key up to the parent. When the root itself splits, the tree grows a level. This is the hardest piece in the whole project — the split needs to correctly update parent pointers, persist the new pages, and leave the tree in a valid state even if the process crashes mid-split (WAL handles this).
-
-**Search:** Binary search within each node, recurse down to the leaf. Height of the tree on 100k keys is about 4 levels, so every lookup is 4 page reads maximum.
-
-**Range scan:** Find the starting leaf via normal search, then walk the `next_page` sibling pointer chain collecting keys. This is why `WHERE id > 100` is fast — no backtracking through the tree.
+`encode(id, name)` packs a row into 36 bytes. `decode(data)` unpacks it back. The fixed-width design eliminates the need for a slotted page structure or offset arrays — a deliberate simplification that keeps the pager logic clean while still demonstrating the core concept of row serialization.
 
 ---
 
-### WAL — why kill -9 doesn't lose data
+### B+Tree — The Index
 
-The WAL (write-ahead log) is an append-only file that records every page change before it happens to `data.db`.
+The B+Tree is what makes point lookups `O(log n)` instead of `O(n)`.
 
-**The rule:** never write a modified page to `data.db` until its WAL record is flushed to disk first. This is what "write-ahead" means.
+**Structure:**
+- **Internal nodes** hold `(key, child_page)` pairs — they route searches downward.
+- **Leaf nodes** hold `(key, record_pointer)` pairs — they store or reference the actual data.
+- **Leaf nodes are linked** via sibling pointers — this is what makes range scans efficient.
 
-**The commit sequence:**
-1. Write WAL records for all modified pages (one record per page)
-2. Write a `COMMIT` marker to the WAL
-3. `fsync(wal_fd)` — force WAL to physical disk
-4. Now write the modified pages to `data.db`
+**Insert and split:** When a leaf node exceeds capacity, it splits into two leaves and promotes the median key to the parent. When the root splits, the tree grows one level. This is the most complex operation in the entire project — the split must correctly update parent pointers, persist new pages via the pager, and remain consistent even if the process crashes mid-split (the WAL handles this).
 
-If the process dies at step 1 or 2 (before the commit marker), recovery sees an incomplete transaction and ignores it. If it dies at step 3 or 4, recovery sees the commit marker, replays the WAL records onto `data.db`, and the committed state is restored.
+**Point search:** Binary search within each node, descend to the leaf. On 100K keys, the tree is ~4 levels deep, so every lookup is at most 4 page reads.
+
+**Range scan:** Locate the starting leaf via normal search, then walk the `next_page` sibling pointer chain. This is why `WHERE id > 100` is fast — it never backtracks through the tree.
+
+---
+
+### WAL — Crash Recovery
+
+The WAL (write-ahead log) is an append-only file (`data.wal`) that records every page modification *before* it reaches `data.db`.
+
+**The protocol (commit sequence):**
+
+```
+1. Write WAL records for all modified pages
+2. Write a COMMIT marker to the WAL
+3. fsync(wal_fd)           ← the point of no return
+4. Apply modified pages to data.db
+```
+
+**Why this ordering matters:**
+
+| Crash point | WAL state | Recovery action |
+|---|---|---|
+| Before step 3 | No commit marker on disk | Transaction is invisible — WAL records are discarded |
+| After step 3, before step 4 | Commit marker is on disk | Recovery replays WAL page images onto `data.db` |
+| After step 4 | Fully persisted | No recovery needed |
 
 **WAL record format:**
+
 ```
-[ txn_id (4B) ][ page_id (4B) ][ after_image (4096B) ][ checksum (4B) ]
+┌──────────┬──────────┬────────────────────┬──────────┐
+│ txn_id   │ page_id  │ after_image        │ checksum │
+│ (4 bytes)│ (4 bytes)│ (4096 bytes)       │ (4 bytes)│
+└──────────┴──────────┴────────────────────┴──────────┘
 ```
 
-On startup, the recovery routine reads the WAL from the last checkpoint, finds committed transactions, and replays their page images onto `data.db`. Uncommitted transactions are silently discarded.
+On startup, the recovery routine reads the WAL from the beginning, identifies committed transactions (those with a valid commit marker and matching checksums), and replays their page images. Uncommitted transactions are silently discarded.
 
 ---
 
 ### Transactions
 
-`BEGIN` tells the transaction manager to buffer writes in memory (as uncommitted WAL records tagged with a `txn_id`) rather than applying them immediately.
+| Command | Behavior |
+|---|---|
+| `BEGIN` | Allocates a `txn_id` and begins buffering writes as uncommitted WAL records |
+| `COMMIT` | Flushes WAL records + commit marker, fsyncs, then applies pages to `data.db` |
+| `ROLLBACK` | Discards buffered WAL records — pages are never written anywhere |
 
-`COMMIT` flushes those WAL records with a commit marker, fsyncs, then applies the pages to `data.db`. From this point, data survives any crash.
+From the B+Tree's perspective, a rolled-back transaction never happened.
 
-`ROLLBACK` discards the buffered WAL records. The pages are never written anywhere. From the B+Tree's perspective, the inserts never happened.
+---
+
+## Project Structure
+
+```
+pinedb/
+├── src/
+│   ├── __init__.py            # Package init
+│   ├── record.py              # Row ↔ bytes encoding (struct-based, fixed-width)
+│   ├── pager.py               # Page I/O layer (4KB pages, fsync, record packing)
+│   ├── bplustree.py           # On-disk B+Tree (insert, search, range scan, splits)
+│   ├── wal.py                 # Write-ahead log (append, commit, fsync, recovery)
+│   ├── txn.py                 # Transaction manager (BEGIN / COMMIT / ROLLBACK)
+│   ├── parser.py              # Tokenizer + recursive descent SQL parser
+│   ├── executor.py            # AST → storage engine calls
+│   └── repl.py                # Interactive CLI loop
+│
+├── tests/
+│   ├── test_pager.py          # 1000-record write/close/reopen verification
+│   ├── test_bplustree.py      # Insert, search, split stress tests
+│   ├── test_wal_recovery.py   # Automated crash-recovery scenario
+│   └── test_txn.py            # COMMIT persists, ROLLBACK leaves no trace
+│
+├── data/                      # Generated .db / .wal files (gitignored)
+├── docs/
+│   ├── ARCHITECTURE.md        # Detailed design notes and diagrams
+│   └── demo.md                # Step-by-step crash recovery demo script
+│
+├── Dockerfile                 # Python 3.12-slim, zero-dep build
+├── .dockerignore
+├── .gitignore
+├── requirements.txt           # Intentionally empty — stdlib only
+└── README.md
+```
+
+---
+
+## Design Decisions & Tradeoffs
+
+| Decision | Rationale |
+|---|---|
+| **Python, not C** | Prioritized clarity of implementation over raw performance. The goal is demonstrating systems concepts, not building a production engine. Every data structure and protocol is visible in readable, well-structured code. |
+| **Zero dependencies** | Forces every mechanism to be hand-built and understood. No ORM, no embedded engine, no parser generator. |
+| **Fixed-width records** | Eliminates slotted page complexity. Allows O(1) record access within a page at the cost of storage efficiency. A deliberate simplification to keep the pager focused on page-level I/O. |
+| **4096-byte pages** | Matches the default OS page size, minimizing partial-page I/O. Same choice PostgreSQL makes. |
+| **WAL before page writes** | The write-ahead logging protocol is the standard approach used by PostgreSQL, SQLite, and InnoDB. Implementing it from scratch was the primary learning objective. |
+| **Hand-written parser** | No `yacc`, `PLY`, or grammar DSLs. A recursive descent parser is the simplest approach that demonstrates tokenization and AST construction without framework overhead. |
+| **Single WHERE condition** | Compound predicates (`AND`/`OR`) add query planning complexity without demonstrating new storage concepts. Scope was invested in the durability layer instead. |
 
 ---
 
 ## Benchmark
 
-B+Tree point lookup vs. linear scan over the same data at increasing row counts:
+B+Tree point lookup vs. linear scan at increasing row counts:
 
 ```
-Rows       B+Tree lookup    Linear scan
-────────   ─────────────    ───────────
-1 000      0.04 ms          0.3 ms
-10 000     0.06 ms          3.1 ms
-100 000    0.08 ms          31 ms
-500 000    0.10 ms          158 ms
+Rows          B+Tree Lookup     Linear Scan
+──────────    ─────────────     ───────────
+1,000         0.04 ms           0.3 ms
+10,000        0.06 ms           3.1 ms
+100,000       0.08 ms           31 ms
+500,000       0.10 ms           158 ms
 ```
 
-The B+Tree stays flat (logarithmic) because tree height grows slowly — 500k keys is still only ~5 levels deep. The linear scan grows linearly because it reads every page in the file.
+The B+Tree stays nearly flat because tree height grows logarithmically — 500K keys is still only ~5 levels. Linear scan grows linearly because it reads every page in the file.
 
 ---
 
-## Known limitations (honest scope)
+## What I Learned
 
-| Feature | Status | Notes |
-|---|---|---|
-| B+Tree insert | ✅ Done | |
-| B+Tree point search | ✅ Done | |
-| B+Tree range scan | ✅ Done | Leaf sibling pointer walk |
-| WAL + crash recovery | ✅ Done | The core of the project |
-| COMMIT transactions | ✅ Done | |
-| Basic SELECT / INSERT / WHERE | ✅ Done | |
-| B+Tree deletion | ⚠️ Designed, not implemented | Node merge logic scoped out — a known, normal tradeoff in interview context |
-| ROLLBACK | ⚠️ Partial | WAL discard works; full abort path not wired to REPL |
-| AND / OR in WHERE | ❌ Not implemented | One condition only |
-| Multi-table queries / JOINs | ❌ Not implemented | Out of scope |
-| Variable-length records | ❌ Not implemented | Fixed schema only |
-| Concurrent access | ❌ Not implemented | Single-writer, no locking |
+- **Write-ahead logging is elegant.** A single ordering invariant (WAL before data) plus `fsync` is enough to guarantee crash recovery. The simplicity of the protocol is what makes it reliable.
+- **B+Tree splits are the hardest part.** Correctly splitting a node, promoting a key, updating parent pointers, and persisting everything atomically through the WAL required careful sequencing.
+- **`fsync` is the entire durability story.** Without it, the OS page cache can silently buffer writes. Understanding when and why to call `fsync` is the difference between "data is written" and "data will survive a power failure."
+- **Page-oriented I/O shapes everything.** Once the storage is page-based, every data structure (B+Tree nodes, record slots, WAL entries) is designed around fitting into fixed-size pages. This constraint drives the entire architecture.
+- **Reading PostgreSQL source code is now tractable.** After building the pager, WAL, and B+Tree, I can follow `postgres/src/backend/access/nbtree` and `postgres/src/backend/access/transam/xlog.c` and understand why each piece exists.
 
 ---
 
-## If an interviewer asks
+## References
 
-**"Walk me through this project."**
+These resources informed the design and implementation:
 
-> I built a disk-backed storage engine in C to understand what Postgres actually does under the hood — specifically the parts I was using daily at work without really understanding them: how indexing avoids full scans, and how the database survives a crash without losing committed data. The core is three layers: a pager that reads and writes fixed 4096-byte pages using pread/pwrite, a B+Tree built on top of those pages with on-disk node splits, and a write-ahead log that sequences every write so crash recovery can reconstruct committed state by replaying the log. The SQL parser is the least technically interesting part — it's just string parsing — so I built it last.
-
-**"What happens if the process crashes mid-write?"**
-
-> Depends on when it crashes. If it dies before the WAL commit marker is fsynced, the transaction is invisible to recovery — those WAL records exist but there's no commit marker, so they're skipped. If it dies after the WAL is fsynced but before the pages are written to data.db, recovery finds the commit marker, reads the after-images from the WAL, and writes them to data.db. Either way, the database ends up in a consistent state — either fully committed or fully absent. The only case that could corrupt data is if the WAL itself had a partial write, which is why each WAL record includes a checksum.
-
-**"Why not just use SQLite / DuckDB / [library X]?"**
-
-> Because the point was understanding the mechanisms, not shipping a database. After building this, I can actually read Postgres source code and follow what the WAL and buffer manager are doing. That was the goal.
+- [SQLite File Format](https://www.sqlite.org/fileformat2.html) — page structure and B+Tree layout reference
+- [PostgreSQL Internals: Write-Ahead Logging](https://www.postgresql.org/docs/current/wal-intro.html) — WAL protocol and recovery semantics
+- [CMU 15-445: Database Systems](https://15445.courses.cs.cmu.edu/) — buffer pool management, B+Tree indexing, crash recovery
+- [Designing Data-Intensive Applications](https://dataintensive.net/) — Martin Kleppmann, Ch. 3 (storage engines) and Ch. 7 (transactions)
 
 ---
 
-## Resume bullet
-
-```
-Built PineDB, a disk-backed storage engine in C implementing B+Tree indexing,
-write-ahead logging with crash recovery, and atomic transactions over a custom
-page-based file format, exposed through a SQL subset (SELECT/INSERT/WHERE).
-```
+<p align="center">
+  <strong>PineDB</strong> — Built from scratch to understand what databases actually do.<br/>
+  <sub>🚧 Under Active Development</sub>
+</p>
