@@ -1,63 +1,69 @@
+"""
+record.py — Layer 2: Row serialization
+
+Supports exactly two column types in V1:
+  INT     — 4 bytes, signed int, struct format 'i'
+  VARCHAR — 32 bytes, null-padded UTF-8 string
+"""
+
 import struct
 
 class Schema:
+    """
+    Defines the layout of a record in a table.
+    """
     def __init__(self, columns: list[tuple[str, str]]):
+        """
+        columns is a list of (col_name, col_type) e.g. [('id','INT'),('name','VARCHAR')]
+        """
         self.columns = columns
-        self._col_names = [col[0] for col in columns]
-        self._col_types = [col[1] for col in columns]
-
-    @property
-    def row_size(self) -> int:
-        size = 0
-        for name, col_type in self.columns:
-            if col_type == 'INT':
-                size += 4
-            elif col_type == 'VARCHAR':
-                size += 32
+        
+        # Calculate row size
+        self.row_size = 0
+        for name, typ in columns:
+            typ = typ.upper()
+            if typ == 'INT':
+                self.row_size += 4
+            elif typ == 'VARCHAR':
+                self.row_size += 32
             else:
-                raise ValueError(f"Unsupported column type {col_type}")
-        return size
+                raise ValueError(f"Unsupported column type: {typ}")
 
     def col_index(self, name: str) -> int:
-        try:
-            return self._col_names.index(name)
-        except ValueError:
-            raise KeyError(f"Column {name} not found")
+        for i, (col_name, _) in enumerate(self.columns):
+            if col_name == name:
+                return i
+        raise ValueError(f"Column {name} not found in schema")
 
     def encode(self, values: list) -> bytes:
         if len(values) != len(self.columns):
-            raise ValueError("Number of values does not match schema")
-
-        encoded_bytes = bytearray()
-        for i, val in enumerate(values):
-            col_type = self._col_types[i]
-            if col_type == 'INT':
-                encoded_bytes.extend(struct.pack('>i', int(val)))
-            elif col_type == 'VARCHAR':
-                str_val = str(val).encode('utf-8')[:32]
-                encoded_bytes.extend(str_val.ljust(32, b'\x00'))
-
-        res = bytes(encoded_bytes)
-        assert len(res) == self.row_size
-        return res
+            raise ValueError(f"Expected {len(self.columns)} values, got {len(values)}")
+            
+        data = b''
+        for i, (name, typ) in enumerate(self.columns):
+            val = values[i]
+            typ = typ.upper()
+            if typ == 'INT':
+                data += struct.pack('>i', int(val))
+            elif typ == 'VARCHAR':
+                val_str = str(val).encode('utf-8')[:32]
+                data += val_str.ljust(32, b'\x00')
+        return data
 
     def decode(self, data: bytes) -> list:
         if len(data) != self.row_size:
-            raise ValueError(f"Data length {len(data)} does not match row size {self.row_size}")
-
+            raise ValueError(f"Expected {self.row_size} bytes, got {len(data)}")
+            
         values = []
         offset = 0
-        for col_type in self._col_types:
-            if col_type == 'INT':
+        for name, typ in self.columns:
+            typ = typ.upper()
+            if typ == 'INT':
                 val = struct.unpack('>i', data[offset:offset+4])[0]
                 values.append(val)
                 offset += 4
-            elif col_type == 'VARCHAR':
-                val_bytes = data[offset:offset+32]
-                val = val_bytes.rstrip(b'\x00').decode('utf-8')
+            elif typ == 'VARCHAR':
+                val = data[offset:offset+32].rstrip(b'\x00').decode('utf-8')
                 values.append(val)
                 offset += 32
         return values
-
-    def col_names(self) -> list[str]:
-        return self._col_names

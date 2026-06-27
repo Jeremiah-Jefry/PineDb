@@ -1,74 +1,81 @@
+"""
+test_wal_recovery.py — Layer 4 verification
+
+CRASH SIMULATION TEST:
+1. Start engine. (We don't have txn_mgr yet, so we'll simulate txn_mgr manually).
+2. Write 50 pages. log_write them. log_commit them.
+3. Simulate crash: DO NOT call apply_to_db. So pager is empty/unwritten!
+4. Close pager/wal.
+5. Reopen pager/wal. Call wal.recover(pager).
+6. Assert all 50 pages are readable from pager.
+"""
+
 import os
+import sys
 import unittest
 import tempfile
-from pinedb.pager import Pager
-from pinedb.wal import WAL
-from pinedb.txn import TransactionManager
-from pinedb.btree import BPlusTree
 
-class TestWalRecovery(unittest.TestCase):
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from pinedb.pager import Pager, PAGE_SIZE
+from pinedb.wal import WAL
+
+class TestWALRecovery(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.db_path = os.path.join(self.temp_dir.name, "wal_test.db")
+        self.db_path = os.path.join(self.temp_dir.name, "test_wal.db")
 
     def tearDown(self):
-        self.temp_dir.cleanup()
+        try:
+            self.temp_dir.cleanup()
+        except:
+            pass
 
-    def test_wal_recovery(self):
-        # 1. Open engine. Begin txn. Insert 50 rows via btree directly. Commit (WAL + log_commit).
+    def test_wal_crash_recovery(self):
         pager = Pager(self.db_path)
         wal = WAL(self.db_path, pager)
-        txn_mgr = TransactionManager(pager, wal)
-
-        class TxnPagerProxy:
-            def __init__(self, pager, txn_mgr, txn_id):
-                self.pager = pager
-                self.txn_mgr = txn_mgr
-                self.txn_id = txn_id
-            def get_page(self, pgno):
-                return self.txn_mgr.read_page(self.txn_id, pgno)
-            def write_page(self, pgno, data):
-                self.txn_mgr.write_page(self.txn_id, pgno, data)
-            def allocate_page(self):
-                pgno = self.pager.allocate_page()
-                self.txn_mgr.write_page(self.txn_id, pgno, b'\x00'*4096)
-                return pgno
-            def get_root_pgno(self):
-                return self.pager.get_root_pgno()
-            def set_root_pgno(self, pgno):
-                self.pager.set_root_pgno(pgno)
-
-        txn_id = txn_mgr.begin()
-        tree = BPlusTree(TxnPagerProxy(pager, txn_mgr, txn_id))
-
-        keys = list(range(1, 51))
-        for k in keys:
-            tree.insert(k, k*100, k%10)
-
-        # Do NOT call apply_to_db — simulate crash before data.db is written
-        buf = txn_mgr._buffers.get(txn_id, {})
-        for page_id, data in buf.items():
-            wal.log_write(txn_id, page_id, data)
+        
+        # Allocate 50 pages
+        pgnos = []
+        payloads = {}
+        for i in range(50):
+            pgno = pager.allocate_page() # allocates empty pages
+            pgnos.append(pgno)
+            
+            # Dirty data
+            payload = bytes([i % 256]) * PAGE_SIZE
+            payloads[pgno] = payload
+            
+        # Write to WAL (txn 1)
+        txn_id = 1
+        for pgno in pgnos:
+            wal.log_write(txn_id, pgno, payloads[pgno])
+            
         wal.log_commit(txn_id)
-
-        # 2. Close pager and WAL WITHOUT flushing data.db.
+        
+        # We DO NOT apply to pager! (Simulate crash)
+        # Verify pager doesn't have the data
+        for pgno in pgnos:
+            data = pager.get_page(pgno)
+            self.assertEqual(data, b'\x00' * PAGE_SIZE)
+            
         pager.close()
         wal.close()
-
-        # 3. Reopen pager and WAL. Call wal.recover(pager).
+        
+        # --- RESTART ---
         pager2 = Pager(self.db_path)
         wal2 = WAL(self.db_path, pager2)
+        
         recovered = wal2.recover(pager2)
-        self.assertGreater(recovered, 0)
-
-        # 4. Read all 50 keys via btree.search(). All must return non-None.
-        tree2 = BPlusTree(pager2)
-        for k in keys:
-            result = tree2.search(k)
-            self.assertIsNotNone(result)
-
+        self.assertEqual(recovered, 50, "Should have recovered 50 pages")
+        
+        # Verify pager has the data now
+        for pgno in pgnos:
+            data = pager2.get_page(pgno)
+            self.assertEqual(data, payloads[pgno], f"Page {pgno} data mismatch")
+            
         pager2.close()
         wal2.close()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

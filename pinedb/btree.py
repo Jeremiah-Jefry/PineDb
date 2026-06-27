@@ -1,239 +1,222 @@
+"""
+btree.py — Layer 3: B+Tree index
+
+Keys are signed 32-bit integers.
+Values are (page_no: uint32, slot: uint16).
+Nodes are exactly 4096 bytes.
+"""
+
 import struct
-from pinedb.pager import Pager, PAGE_SIZE, PAGE_LEAF, PAGE_INTERNAL
+from pinedb.pager import (
+    Pager, PAGE_SIZE, PAGE_LEAF, PAGE_INTERNAL,
+    encode_page_header, decode_page_header
+)
 
-KEY_SIZE   = 4
-VAL_SIZE   = 6
-ENTRY_SIZE = 10
-PTR_SIZE   = 4
-
-PAGE_HEADER_SIZE = 16
-PAGE_BODY_SIZE = PAGE_SIZE - PAGE_HEADER_SIZE
-
-LEAF_ORDER    = PAGE_BODY_SIZE // ENTRY_SIZE
-INTERNAL_ORDER = (PAGE_BODY_SIZE - PTR_SIZE) // (KEY_SIZE + PTR_SIZE)
+LEAF_ORDER = 408
+INTERNAL_ORDER = 509
 
 class BPlusTree:
-    def __init__(self, pager: Pager, root_pgno: int = 0):
+    def __init__(self, pager: Pager, txn_mgr=None):
+        """
+        txn_mgr is injected later (Layer 5) for transactional writes.
+        If None, we write directly to the pager.
+        """
         self.pager = pager
-        self.root_pgno = root_pgno
-        if self.root_pgno == 0:
-            self.root_pgno = self.pager.get_root_pgno()
+        self.txn_mgr = txn_mgr
 
-    def search(self, key: int) -> tuple[int, int] | None:
-        if self.root_pgno == 0:
-            return None
+    def read_page(self, pgno: int, txn_id: int = None) -> bytes:
+        if self.txn_mgr and txn_id is not None:
+            return self.txn_mgr.read_page(txn_id, pgno)
+        return self.pager.get_page(pgno)
 
-        curr_pgno = self.root_pgno
-        while True:
-            page_data = self.pager.get_page(curr_pgno)
-            page_type = struct.unpack('>B', page_data[0:1])[0]
-
-            if page_type == PAGE_LEAF:
-                break
-            elif page_type == PAGE_INTERNAL:
-                _, keys, children = self._read_internal(curr_pgno)
-                found = False
-                for i, k in enumerate(keys):
-                    if key < k:
-                        curr_pgno = children[i]
-                        found = True
-                        break
-                if not found:
-                    curr_pgno = children[-1]
-            else:
-                raise ValueError(f"Invalid page type {page_type} in BTree")
-
-        _, entries, _ = self._read_leaf(curr_pgno)
-        # Binary search
-        left, right = 0, len(entries) - 1
-        while left <= right:
-            mid = (left + right) // 2
-            k, pg, slot = entries[mid]
-            if k == key:
-                return (pg, slot)
-            elif k < key:
-                left = mid + 1
-            else:
-                right = mid - 1
-        return None
-
-    def insert(self, key: int, record_page: int, record_slot: int) -> None:
-        if self.root_pgno == 0:
-            new_root_pgno = self.pager.allocate_page()
-            self._write_leaf(new_root_pgno, [(key, record_page, record_slot)], 0)
-            self.root_pgno = new_root_pgno
-            self.pager.set_root_pgno(self.root_pgno)
-            return
-
-        leaf_pgno, parent_path = self._find_leaf(key)
-        _, entries, next_page = self._read_leaf(leaf_pgno)
-
-        # Insert entry in sorted order
-        inserted = False
-        for i, (k, _, _) in enumerate(entries):
-            if key < k:
-                entries.insert(i, (key, record_page, record_slot))
-                inserted = True
-                break
-            elif key == k:
-                # Update existing (if we want to support it, but assuming unique for now)
-                entries[i] = (key, record_page, record_slot)
-                inserted = True
-                break
-
-        if not inserted:
-            entries.append((key, record_page, record_slot))
-
-        if len(entries) <= LEAF_ORDER:
-            self._write_leaf(leaf_pgno, entries, next_page)
+    def write_page(self, pgno: int, data: bytes, txn_id: int = None) -> None:
+        if self.txn_mgr and txn_id is not None:
+            self.txn_mgr.write_page(txn_id, pgno, data)
         else:
-            new_leaf_pgno, push_key = self._split_leaf(leaf_pgno, entries)
-            self._insert_into_parent(leaf_pgno, push_key, new_leaf_pgno, parent_path)
+            self.pager.write_page(pgno, data)
 
-    def _read_leaf(self, pgno: int) -> tuple[int, list[tuple[int,int,int]], int]:
-        data = self.pager.get_page(pgno)
-        page_type, page_id, num_slots, _, next_page = struct.unpack('>B3xIHHI', data[:16])
-        if page_type != PAGE_LEAF:
-            raise ValueError(f"Page {pgno} is not a leaf node (type {page_type})")
+    def allocate_page(self, txn_id: int = None) -> int:
+        # Pager.allocate_page always extends the file directly and returns a pgno.
+        # The new page is empty.
+        pgno = self.pager.allocate_page()
+        # Ensure the page is dirty in the transaction buffer if using txn
+        if self.txn_mgr and txn_id is not None:
+            self.write_page(pgno, b'\x00' * PAGE_SIZE, txn_id)
+        return pgno
 
+    def get_root_pgno(self) -> int:
+        return self.pager.get_root_pgno()
+
+    def set_root_pgno(self, pgno: int) -> None:
+        self.pager.set_root_pgno(pgno)
+
+    # --- Node parsing helpers ---
+
+    def _parse_leaf(self, data: bytes):
+        page_type, page_id, num_slots, _, next_page = decode_page_header(data)
+        assert page_type == PAGE_LEAF
         entries = []
         offset = 16
         for _ in range(num_slots):
-            k, p, s = struct.unpack('>iIH', data[offset:offset+10])
-            entries.append((k, p, s))
+            key = struct.unpack_from('>i', data, offset)[0]
+            val_pg, val_slot = struct.unpack_from('>IH', data, offset + 4)
+            entries.append((key, val_pg, val_slot))
             offset += 10
+        return page_id, next_page, entries
 
-        return page_id, entries, next_page
+    def _pack_leaf(self, page_id: int, next_page: int, entries: list) -> bytes:
+        header = encode_page_header(PAGE_LEAF, page_id, len(entries), next_page)
+        body = b''.join(struct.pack('>iIH', k, p, s) for k, p, s in entries)
+        return header + body
 
-    def _write_leaf(self, pgno: int, entries: list[tuple[int,int,int]], next_page: int) -> None:
-        num_slots = len(entries)
-        header = struct.pack('>B3xIHHI', PAGE_LEAF, pgno, num_slots, 0, next_page)
-
-        body = bytearray()
-        for k, p, s in entries:
-            body.extend(struct.pack('>iIH', k, p, s))
-
-        page_data = header + body
-        page_data = page_data.ljust(PAGE_SIZE, b'\x00')
-        assert len(page_data) == PAGE_SIZE
-        self.pager.write_page(pgno, page_data)
-
-    def _read_internal(self, pgno: int) -> tuple[int, list[int], list[int]]:
-        data = self.pager.get_page(pgno)
-        page_type, page_id, num_slots, _, _ = struct.unpack('>B3xIHHI', data[:16])
-        if page_type != PAGE_INTERNAL:
-            raise ValueError(f"Page {pgno} is not an internal node (type {page_type})")
-
-        keys = []
+    def _parse_internal(self, data: bytes):
+        page_type, page_id, num_slots, _, _ = decode_page_header(data)
+        assert page_type == PAGE_INTERNAL
         children = []
+        keys = []
         offset = 16
-
-        # Read first child pointer
-        children.append(struct.unpack('>I', data[offset:offset+4])[0])
-        offset += 4
-
         for _ in range(num_slots):
-            k = struct.unpack('>i', data[offset:offset+4])[0]
-            keys.append(k)
-            offset += 4
-
-            c = struct.unpack('>I', data[offset:offset+4])[0]
-            children.append(c)
-            offset += 4
-
+            child = struct.unpack_from('>I', data, offset)[0]
+            key = struct.unpack_from('>i', data, offset + 4)[0]
+            children.append(child)
+            keys.append(key)
+            offset += 8
+        # last child
+        last_child = struct.unpack_from('>I', data, offset)[0]
+        children.append(last_child)
         return page_id, keys, children
 
-    def _write_internal(self, pgno: int, keys: list[int], children: list[int]) -> None:
-        num_slots = len(keys)
-        header = struct.pack('>B3xIHHI', PAGE_INTERNAL, pgno, num_slots, 0, 0)
+    def _pack_internal(self, page_id: int, keys: list, children: list) -> bytes:
+        header = encode_page_header(PAGE_INTERNAL, page_id, len(keys), 0)
+        body = b''
+        for i in range(len(keys)):
+            body += struct.pack('>Ii', children[i], keys[i])
+        body += struct.pack('>I', children[-1])
+        return header + body
 
-        body = bytearray()
-        body.extend(struct.pack('>I', children[0]))
+    # --- Search ---
 
-        for i in range(num_slots):
-            body.extend(struct.pack('>i', keys[i]))
-            body.extend(struct.pack('>I', children[i+1]))
+    def search(self, key: int, txn_id: int = None) -> tuple[int, int] | None:
+        root_pgno = self.get_root_pgno()
+        if root_pgno == 0:
+            return None
+        
+        leaf_pgno = self._find_leaf(key, root_pgno, txn_id)
+        data = self.read_page(leaf_pgno, txn_id)
+        _, _, entries = self._parse_leaf(data)
+        
+        # Binary search could be used here, but linear is fine for in-memory lists of size < 408
+        for k, val_pg, val_slot in entries:
+            if k == key:
+                return (val_pg, val_slot)
+        return None
 
-        page_data = header + body
-        page_data = page_data.ljust(PAGE_SIZE, b'\x00')
-        assert len(page_data) == PAGE_SIZE
-        self.pager.write_page(pgno, page_data)
+    def _find_leaf(self, key: int, current_pgno: int, txn_id: int) -> int:
+        data = self.read_page(current_pgno, txn_id)
+        page_type, _, _, _, _ = decode_page_header(data)
+        
+        if page_type == PAGE_LEAF:
+            return current_pgno
+        elif page_type == PAGE_INTERNAL:
+            _, keys, children = self._parse_internal(data)
+            # Find the first child where key < keys[i], or use the last child
+            for i, k in enumerate(keys):
+                if key < k:
+                    return self._find_leaf(key, children[i], txn_id)
+            return self._find_leaf(key, children[-1], txn_id)
+        else:
+            raise RuntimeError(f"Invalid page type {page_type} in BTree")
 
-    def _find_leaf(self, key: int) -> tuple[int, list[tuple[int, int]]]:
-        curr_pgno = self.root_pgno
-        parent_path = []
+    # --- Insert ---
 
-        while True:
-            data = self.pager.get_page(curr_pgno)
-            page_type = struct.unpack('>B', data[0:1])[0]
-
-            if page_type == PAGE_LEAF:
-                return curr_pgno, parent_path
-            elif page_type == PAGE_INTERNAL:
-                _, keys, children = self._read_internal(curr_pgno)
-
-                found = False
-                for i, k in enumerate(keys):
-                    if key < k:
-                        parent_path.append((curr_pgno, i))
-                        curr_pgno = children[i]
-                        found = True
-                        break
-
-                if not found:
-                    parent_path.append((curr_pgno, len(keys)))
-                    curr_pgno = children[-1]
-            else:
-                raise ValueError("Invalid page type during traversal")
-
-    def _split_leaf(self, pgno: int, entries: list) -> tuple[int, int]:
-        _, _, old_next_page = self._read_leaf(pgno)
-        mid = len(entries) // 2
-
-        left_entries = entries[:mid]
-        right_entries = entries[mid:]
-
-        new_leaf_pgno = self.pager.allocate_page()
-
-        self._write_leaf(new_leaf_pgno, right_entries, old_next_page)
-        self._write_leaf(pgno, left_entries, new_leaf_pgno)
-
-        return new_leaf_pgno, right_entries[0][0]
-
-    def _split_internal(self, pgno: int, keys: list, children: list) -> tuple[int, int]:
-        mid = len(keys) // 2
-
-        left_keys = keys[:mid]
-        left_children = children[:mid+1]
-
-        median_key = keys[mid]
-
-        right_keys = keys[mid+1:]
-        right_children = children[mid+1:]
-
-        new_internal_pgno = self.pager.allocate_page()
-
-        self._write_internal(new_internal_pgno, right_keys, right_children)
-        self._write_internal(pgno, left_keys, left_children)
-
-        return new_internal_pgno, median_key
-
-    def _insert_into_parent(self, left_pgno: int, push_key: int, right_pgno: int, parent_path: list[tuple[int, int]]) -> None:
-        if not parent_path:
-            new_root_pgno = self.pager.allocate_page()
-            self._write_internal(new_root_pgno, [push_key], [left_pgno, right_pgno])
-            self.root_pgno = new_root_pgno
-            self.pager.set_root_pgno(self.root_pgno)
+    def insert(self, key: int, record_page: int, record_slot: int, txn_id: int = None) -> None:
+        root_pgno = self.get_root_pgno()
+        if root_pgno == 0:
+            # Tree empty, create first leaf as root
+            root_pgno = self.allocate_page(txn_id)
+            leaf_data = self._pack_leaf(root_pgno, 0, [(key, record_page, record_slot)])
+            self.write_page(root_pgno, leaf_data, txn_id)
+            self.set_root_pgno(root_pgno)
             return
 
-        parent_pgno, insert_index = parent_path.pop()
-        _, keys, children = self._read_internal(parent_pgno)
+        # Find leaf and keep track of path for parent updates
+        path = []
+        curr = root_pgno
+        while True:
+            data = self.read_page(curr, txn_id)
+            ptype, _, _, _, _ = decode_page_header(data)
+            if ptype == PAGE_LEAF:
+                break
+            _, keys, children = self._parse_internal(data)
+            path.append(curr)
+            found = False
+            for i, k in enumerate(keys):
+                if key < k:
+                    curr = children[i]
+                    found = True
+                    break
+            if not found:
+                curr = children[-1]
 
-        keys.insert(insert_index, push_key)
-        children.insert(insert_index + 1, right_pgno)
-
-        if len(keys) <= INTERNAL_ORDER:
-            self._write_internal(parent_pgno, keys, children)
+        leaf_pgno = curr
+        data = self.read_page(leaf_pgno, txn_id)
+        _, next_page, entries = self._parse_leaf(data)
+        
+        # Insert in sorted order
+        entries.append((key, record_page, record_slot))
+        entries.sort(key=lambda x: x[0])
+        
+        if len(entries) <= LEAF_ORDER:
+            self.write_page(leaf_pgno, self._pack_leaf(leaf_pgno, next_page, entries), txn_id)
         else:
-            new_internal_pgno, median_key = self._split_internal(parent_pgno, keys, children)
-            self._insert_into_parent(parent_pgno, median_key, new_internal_pgno, parent_path)
+            # Split leaf
+            mid = len(entries) // 2
+            left_entries = entries[:mid]
+            right_entries = entries[mid:]
+            
+            new_leaf_pgno = self.allocate_page(txn_id)
+            median_key = right_entries[0][0]
+            
+            # Right leaf becomes the new page, linked after the left leaf
+            self.write_page(new_leaf_pgno, self._pack_leaf(new_leaf_pgno, next_page, right_entries), txn_id)
+            self.write_page(leaf_pgno, self._pack_leaf(leaf_pgno, new_leaf_pgno, left_entries), txn_id)
+            
+            self._insert_into_parent(leaf_pgno, median_key, new_leaf_pgno, path, txn_id)
+
+    def _insert_into_parent(self, left_pgno: int, key: int, right_pgno: int, path: list, txn_id: int) -> None:
+        if not path:
+            # Root split
+            new_root = self.allocate_page(txn_id)
+            internal_data = self._pack_internal(new_root, [key], [left_pgno, right_pgno])
+            self.write_page(new_root, internal_data, txn_id)
+            self.set_root_pgno(new_root)
+            return
+            
+        parent_pgno = path.pop()
+        data = self.read_page(parent_pgno, txn_id)
+        _, keys, children = self._parse_internal(data)
+        
+        # Insert key and right_pgno at the correct position
+        idx = children.index(left_pgno)
+        keys.insert(idx, key)
+        children.insert(idx + 1, right_pgno)
+        
+        if len(keys) <= INTERNAL_ORDER:
+            self.write_page(parent_pgno, self._pack_internal(parent_pgno, keys, children), txn_id)
+        else:
+            # Split internal
+            mid = len(keys) // 2
+            median_key = keys[mid]
+            
+            left_keys = keys[:mid]
+            left_children = children[:mid + 1]
+            
+            right_keys = keys[mid + 1:]
+            right_children = children[mid + 1:]
+            
+            new_internal_pgno = self.allocate_page(txn_id)
+            
+            self.write_page(new_internal_pgno, self._pack_internal(new_internal_pgno, right_keys, right_children), txn_id)
+            self.write_page(parent_pgno, self._pack_internal(parent_pgno, left_keys, left_children), txn_id)
+            
+            self._insert_into_parent(parent_pgno, median_key, new_internal_pgno, path, txn_id)

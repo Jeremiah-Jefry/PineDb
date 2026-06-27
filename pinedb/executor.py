@@ -1,258 +1,266 @@
+"""
+executor.py — Layer 7: Executor
+
+Ast -> BTree / Transaction Manager calls
+"""
+
 import json
-import struct
-from pinedb.pager import Pager, PAGE_SIZE, PAGE_DATA
+from pinedb.pager import Pager, PAGE_DATA, encode_page_header, decode_page_header, PAGE_SIZE
 from pinedb.wal import WAL
 from pinedb.txn import TransactionManager
-from pinedb.record import Schema
 from pinedb.btree import BPlusTree
+from pinedb.record import Schema
 from pinedb.parser import CreateTable, InsertInto, Select, BeginTxn, CommitTxn
+
+CATALOG_PGNO = 1
 
 class Executor:
     def __init__(self, pager: Pager, wal: WAL, txn_mgr: TransactionManager):
         self.pager = pager
         self.wal = wal
         self.txn_mgr = txn_mgr
-        self.catalog: dict[str, dict] = {}
-        self.trees: dict[str, BPlusTree] = {}
-        self._load_catalog()
-
-    def execute(self, node) -> list[dict] | str:
-        if isinstance(node, CreateTable):
-            return self._handle_create_table(node)
-        elif isinstance(node, InsertInto):
-            return self._handle_insert(node)
-        elif isinstance(node, Select):
-            return self._handle_select(node)
-        elif isinstance(node, BeginTxn):
-            self.txn_mgr.begin()
-            return "Transaction started."
-        elif isinstance(node, CommitTxn):
-            txns = self.txn_mgr.active_txns()
-            if not txns:
-                return "No active transaction."
-            txn_id = txns[0]
-            self.txn_mgr.commit(txn_id)
-            return "Transaction committed."
+        self.active_txn = None
+        
+        # Ensure file has catalog page
+        while self.pager.page_count() <= CATALOG_PGNO:
+            self.pager.allocate_page()
+            
+        self.catalog = self._load_catalog() # table_name -> {'schema': Schema, 'root_pgno': int}
+        
+    def _load_catalog(self):
+        data = self.pager.get_page(CATALOG_PGNO)
+        # We can use a simple JSON encoding padded with 0s for the catalog in V1
+        content = data.rstrip(b'\x00')
+        if not content:
+            return {}
+            
+        try:
+            raw_catalog = json.loads(content.decode('utf-8'))
+            catalog = {}
+            for table_name, info in raw_catalog.items():
+                catalog[table_name] = {
+                    'schema': Schema(info['columns']),
+                    'root_pgno': info['root_pgno']
+                }
+            return catalog
+        except Exception:
+            return {}
+            
+    def _save_catalog(self, txn_id=None):
+        raw_catalog = {}
+        for table_name, info in self.catalog.items():
+            raw_catalog[table_name] = {
+                'columns': info['schema'].columns,
+                'root_pgno': info['root_pgno']
+            }
+            
+        content = json.dumps(raw_catalog).encode('utf-8')
+        if len(content) > PAGE_SIZE:
+            raise RuntimeError("Catalog too large for single page in V1")
+        
+        content = content.ljust(PAGE_SIZE, b'\x00')
+            
+        if txn_id is not None:
+            self.txn_mgr.write_page(txn_id, CATALOG_PGNO, content)
         else:
-            return "Unknown command."
+            self.pager.write_page(CATALOG_PGNO, content)
+            
+    def _get_txn(self):
+        if self.active_txn is not None:
+            return self.active_txn, False # False means it's part of a larger explicit txn
+        # Auto-commit transaction
+        return self.txn_mgr.begin(), True
 
-    def _handle_create_table(self, node: CreateTable) -> str:
-        if node.table_name in self.catalog:
-            raise ValueError(f"Table {node.table_name} already exists.")
+    def execute(self, ast) -> list[dict] | str:
+        if isinstance(ast, BeginTxn):
+            if self.active_txn is not None:
+                raise RuntimeError("Transaction already active")
+            self.active_txn = self.txn_mgr.begin()
+            return "Transaction started"
+            
+        elif isinstance(ast, CommitTxn):
+            if self.active_txn is None:
+                raise RuntimeError("No active transaction to commit")
+            self.txn_mgr.commit(self.active_txn)
+            self.active_txn = None
+            return "Transaction committed"
+            
+        elif isinstance(ast, CreateTable):
+            return self._execute_create_table(ast)
+            
+        elif isinstance(ast, InsertInto):
+            return self._execute_insert_into(ast)
+            
+        elif isinstance(ast, Select):
+            return self._execute_select(ast)
+            
+        raise NotImplementedError(f"Unsupported AST node: {type(ast)}")
 
-        schema = Schema(node.columns)
-
-        # Allocate leaf page for B+Tree root
-        root_pgno = self.pager.allocate_page()
-        # Initialize the leaf page
-        leaf_header = struct.pack('>B3xIHHI', 1, root_pgno, 0, 0, 0) # 1 = PAGE_LEAF
-        leaf_data = leaf_header.ljust(PAGE_SIZE, b'\x00')
-        self.pager.write_page(root_pgno, leaf_data)
-
-        # Allocate data page
-        data_pgno = self.pager.allocate_page()
-        data_header = struct.pack('>B3xIHHI', PAGE_DATA, data_pgno, 0, 0, 0)
-        data_page = data_header.ljust(PAGE_SIZE, b'\x00')
-        self.pager.write_page(data_pgno, data_page)
-
-        self.catalog[node.table_name] = {
-            "name": node.table_name,
-            "columns": node.columns,
-            "root_pgno": root_pgno,
-            "data_head": data_pgno,
-            "data_tail": data_pgno,
-            "data_tail_slots": 0
+    def _execute_create_table(self, ast: CreateTable):
+        if ast.table_name in self.catalog:
+            raise RuntimeError(f"Table {ast.table_name} already exists")
+            
+        txn_id, auto_commit = self._get_txn()
+        
+        # BTree uses the pager for allocating.
+        # But wait, BPlusTree uses pager.set_root_pgno() which modifies page 0.
+        # For multiple tables, we shouldn't use page 0 root_pgno.
+        # The spec says: "Allocate a new root page for this table's B+Tree... Persist catalog"
+        btree = BPlusTree(self.pager, self.txn_mgr)
+        root_pgno = btree.allocate_page(txn_id)
+        
+        empty_leaf = btree._pack_leaf(root_pgno, 0, [])
+        btree.write_page(root_pgno, empty_leaf, txn_id)
+        
+        self.catalog[ast.table_name] = {
+            'schema': Schema(ast.columns),
+            'root_pgno': root_pgno
         }
-
-        self._persist_catalog()
-        return "Table created."
-
-    def _handle_insert(self, node: InsertInto) -> str:
-        if node.table_name not in self.catalog:
-            raise ValueError(f"Table {node.table_name} not found.")
-
-        meta = self.catalog[node.table_name]
-        schema = Schema(meta["columns"])
-
-        if len(node.values) != len(schema.columns):
-            raise ValueError("Value count does not match column count.")
-
-        txns = self.txn_mgr.active_txns()
-        auto_commit = False
-        if not txns:
-            txn_id = self.txn_mgr.begin()
-            auto_commit = True
-        else:
-            txn_id = txns[0]
-
-        data_tail_pgno = meta["data_tail"]
-        slots = meta["data_tail_slots"]
-
-        max_rows = (PAGE_SIZE - 16) // schema.row_size
-
-        if slots >= max_rows:
-            # Allocate new data page
-            new_data_pgno = self.pager.allocate_page()
-            new_header = struct.pack('>B3xIHHI', PAGE_DATA, new_data_pgno, 0, 0, 0)
-            new_page = new_header.ljust(PAGE_SIZE, b'\x00')
-            self.txn_mgr.write_page(txn_id, new_data_pgno, new_page)
-
-            # Update old tail's next_page
-            old_tail_data = bytearray(self.txn_mgr.read_page(txn_id, data_tail_pgno))
-            # next_page is at offset 12 in the 16-byte header
-            struct.pack_into('>I', old_tail_data, 12, new_data_pgno)
-            self.txn_mgr.write_page(txn_id, data_tail_pgno, bytes(old_tail_data))
-
-            meta["data_tail"] = new_data_pgno
-            meta["data_tail_slots"] = 0
-
-            data_tail_pgno = new_data_pgno
-            slots = 0
-
-        # Read tail page, insert row
-        page_data = bytearray(self.txn_mgr.read_page(txn_id, data_tail_pgno))
-
-        encoded_row = schema.encode(node.values)
-        offset = 16 + slots * schema.row_size
-        page_data[offset:offset+schema.row_size] = encoded_row
-
-        # Update num_slots
-        struct.pack_into('>H', page_data, 8, slots + 1)
-
-        self.txn_mgr.write_page(txn_id, data_tail_pgno, bytes(page_data))
-
-        # Insert into B+Tree
-        # We need a B+Tree that reads/writes through the transaction manager for this to be transactional.
-        # But for V1, the prompt says: B+Tree must also use txn.write_page() / txn.read_page() for its pages.
-        # Let's wrap the pager with a TxnPager for the B+Tree, or just do direct updates if we don't have that.
-        # Wait, the prompt says: "B+Tree must also use txn.write_page() / txn.read_page() for its pages."
-        # We need to adapt BPlusTree or pass a proxy.
-
-        class TxnPagerProxy:
-            def __init__(self, pager, txn_mgr, txn_id):
-                self.pager = pager
-                self.txn_mgr = txn_mgr
-                self.txn_id = txn_id
-            def get_page(self, pgno):
-                return self.txn_mgr.read_page(self.txn_id, pgno)
-            def write_page(self, pgno, data):
-                self.txn_mgr.write_page(self.txn_id, pgno, data)
-            def allocate_page(self):
-                pgno = self.pager.allocate_page()
-                # zero page is created by pager, need to buffer it in txn
-                self.txn_mgr.write_page(self.txn_id, pgno, b'\x00'*PAGE_SIZE)
-                return pgno
-            def get_root_pgno(self):
-                return self.pager.get_root_pgno()
-            def set_root_pgno(self, pgno):
-                self.pager.set_root_pgno(pgno)
-
-        tree = BPlusTree(TxnPagerProxy(self.pager, self.txn_mgr, txn_id), meta["root_pgno"])
-
-        # First INT col is the key
-        key_idx = -1
-        for i, col in enumerate(schema.columns):
-            if col[1] == 'INT':
-                key_idx = i
-                break
-        if key_idx == -1:
-            raise ValueError("No INT column found for primary key")
-
-        key_val = int(node.values[key_idx])
-        tree.insert(key_val, data_tail_pgno, slots)
-
-        # Update catalog meta for root_pgno if tree root changed
-        meta["root_pgno"] = tree.root_pgno
-        meta["data_tail_slots"] = slots + 1
-        self._persist_catalog()
-
+        self._save_catalog(txn_id)
+        
         if auto_commit:
             self.txn_mgr.commit(txn_id)
+            
+        return f"Table {ast.table_name} created"
 
-        return "1 row inserted."
-
-    def _handle_select(self, node: Select) -> list[dict]:
-        if node.table_name not in self.catalog:
-            raise ValueError(f"Table {node.table_name} not found.")
-
-        meta = self.catalog[node.table_name]
-        schema = Schema(meta["columns"])
-
-        # We read directly from pager (committed data) for SELECT
-        # Unless we are in a txn, then we should read from txn buffers.
-        txns = self.txn_mgr.active_txns()
-        txn_id = txns[0] if txns else None
-
-        def read_page(pgno):
-            if txn_id is not None:
-                return self.txn_mgr.read_page(txn_id, pgno)
-            return self.pager.get_page(pgno)
-
-        if node.where_col is not None:
-            # Point lookup via B+Tree
-            key_val = int(node.where_val)
-
-            class ReadOnlyTxnPagerProxy:
-                def __init__(self, pager, txn_mgr, txn_id):
-                    self.pager = pager
-                    self.txn_mgr = txn_mgr
-                    self.txn_id = txn_id
-                def get_page(self, pgno):
-                    if self.txn_id is not None:
-                        return self.txn_mgr.read_page(self.txn_id, pgno)
-                    return self.pager.get_page(pgno)
-                def get_root_pgno(self):
-                    return self.pager.get_root_pgno()
-
-            tree = BPlusTree(ReadOnlyTxnPagerProxy(self.pager, self.txn_mgr, txn_id), meta["root_pgno"])
-            result = tree.search(key_val)
-
-            if result is None:
-                return []
-
-            page_no, slot = result
-            page_data = read_page(page_no)
-
-            offset = 16 + slot * schema.row_size
-            row_bytes = page_data[offset:offset+schema.row_size]
-            values = schema.decode(row_bytes)
-            return [dict(zip(schema.col_names(), values))]
-
-        else:
-            # Full scan
-            results = []
-            curr_pgno = meta["data_head"]
-            while curr_pgno != 0:
-                page_data = read_page(curr_pgno)
-                page_type, _, num_slots, _, next_page = struct.unpack('>B3xIHHI', page_data[:16])
-                if page_type != PAGE_DATA:
+    def _execute_insert_into(self, ast: InsertInto):
+        if ast.table_name not in self.catalog:
+            raise RuntimeError(f"Table {ast.table_name} does not exist")
+            
+        info = self.catalog[ast.table_name]
+        schema = info['schema']
+        root_pgno = info['root_pgno']
+        
+        txn_id, auto_commit = self._get_txn()
+        
+        encoded_row = schema.encode(ast.values)
+        
+        # Find a data page with space, or allocate a new one.
+        # For V1, we can just do a very simple scan of all data pages.
+        # But wait, scanning all pages is slow. The spec says: "allocate new data page when current one is full".
+        # Let's just track a 'last_data_pgno' or search backwards from pager.page_count().
+        data_pgno = None
+        for pg in range(self.pager.page_count() - 1, 1, -1):
+            page_data = self.txn_mgr.read_page(txn_id, pg)
+            ptype, _, num_slots, _, next_page = decode_page_header(page_data)
+            if ptype == PAGE_DATA:
+                max_slots = (PAGE_SIZE - 16) // schema.row_size
+                if num_slots < max_slots:
+                    data_pgno = pg
                     break
+                    
+        if data_pgno is None:
+            data_pgno = self.pager.allocate_page()
+            # Ensure dirty
+            header = encode_page_header(PAGE_DATA, data_pgno, 0, 0)
+            self.txn_mgr.write_page(txn_id, data_pgno, header)
+            
+        # Read the page
+        page_data = bytearray(self.txn_mgr.read_page(txn_id, data_pgno))
+        _, _, num_slots, _, _ = decode_page_header(page_data)
+        
+        # Write row to slot
+        slot = num_slots
+        offset = 16 + slot * schema.row_size
+        page_data[offset:offset + schema.row_size] = encoded_row
+        
+        # Update header
+        new_header = encode_page_header(PAGE_DATA, data_pgno, num_slots + 1, 0)
+        page_data[:16] = new_header
+        
+        self.txn_mgr.write_page(txn_id, data_pgno, bytes(page_data))
+        
+        # Get key for BTree (assume first column is the key, and it's INT)
+        key_val = ast.values[0]
+        
+        # Subclass BPlusTree to override root_pgno fetching since it's per table now
+        class TableBTree(BPlusTree):
+            def get_root_pgno(self):
+                return root_pgno
+            def set_root_pgno(self, pgno):
+                info['root_pgno'] = pgno
+                # In a real system, we'd dirty the catalog page here.
+                # Since _save_catalog is called right below, it's fine.
+                
+        btree = TableBTree(self.pager, self.txn_mgr)
+        btree.insert(key_val, data_pgno, slot, txn_id)
+        
+        # Save catalog if root changed
+        self._save_catalog(txn_id)
+        
+        if auto_commit:
+            self.txn_mgr.commit(txn_id)
+            
+        return "1 row inserted"
 
-                offset = 16
-                for _ in range(num_slots):
-                    row_bytes = page_data[offset:offset+schema.row_size]
-                    values = schema.decode(row_bytes)
-                    results.append(dict(zip(schema.col_names(), values)))
-                    offset += schema.row_size
-
-                curr_pgno = next_page
-
-            return results
-
-    def _persist_catalog(self) -> None:
-        encoded = json.dumps(self.catalog).encode('utf-8')
-        padded = encoded.ljust(PAGE_SIZE, b'\x00')[:PAGE_SIZE]
-
-        # If page 1 doesn't exist, allocate it.
-        # But wait, allocate_page might change page count.
-        while self.pager.page_count() < 2:
-            self.pager.allocate_page()
-
-        self.pager.write_page(1, padded)
-
-    def _load_catalog(self) -> None:
-        while self.pager.page_count() < 2:
-            self.pager.allocate_page()
-
-        data = self.pager.get_page(1).rstrip(b'\x00')
-        self.catalog = json.loads(data) if data else {}
+    def _execute_select(self, ast: Select):
+        if ast.table_name not in self.catalog:
+            raise RuntimeError(f"Table {ast.table_name} does not exist")
+            
+        info = self.catalog[ast.table_name]
+        schema = info['schema']
+        root_pgno = info['root_pgno']
+        
+        txn_id = self.active_txn
+        # If no active txn, we can still read via pager directly, but better to use read_page with None
+        
+        class TableBTree(BPlusTree):
+            def get_root_pgno(self):
+                return root_pgno
+                
+        btree = TableBTree(self.pager, self.txn_mgr)
+        
+        results = []
+        if ast.where_col is not None:
+            # Point lookup
+            if ast.where_col != schema.columns[0][0]:
+                raise RuntimeError("V1 only supports WHERE on the primary key (first column)")
+                
+            res = btree.search(ast.where_val, txn_id)
+            if res is not None:
+                data_pgno, slot = res
+                page_data = btree.read_page(data_pgno, txn_id)
+                offset = 16 + slot * schema.row_size
+                row_data = page_data[offset:offset + schema.row_size]
+                values = schema.decode(row_data)
+                
+                row_dict = {}
+                for i, (col_name, _) in enumerate(schema.columns):
+                    row_dict[col_name] = values[i]
+                results.append(row_dict)
+        else:
+            # Full scan: Walk all data pages (slow but simple for V1)
+            # Actually, the spec says "walk leaf pages from leftmost leaf" for BTree.
+            # Let's walk the BTree leaves.
+            curr = root_pgno
+            while True:
+                data = btree.read_page(curr, txn_id)
+                ptype, _, num_slots, _, next_page = decode_page_header(data)
+                if ptype == PAGE_DATA or ptype == PAGE_FREE: 
+                    # Should not reach here for BTree root
+                    break
+                if ptype == PAGE_LEAF:
+                    break
+                _, _, children = btree._parse_internal(data)
+                curr = children[0] # Go leftmost
+                
+            leaf_pgno = curr
+            while leaf_pgno != 0:
+                data = btree.read_page(leaf_pgno, txn_id)
+                ptype, _, _, next_page = decode_page_header(data)[:4] # _parse_leaf expects correct unpack
+                _, next_page, entries = btree._parse_leaf(data)
+                
+                for key, data_pgno, slot in entries:
+                    page_data = btree.read_page(data_pgno, txn_id)
+                    offset = 16 + slot * schema.row_size
+                    row_data = page_data[offset:offset + schema.row_size]
+                    values = schema.decode(row_data)
+                    
+                    row_dict = {}
+                    for i, (col_name, _) in enumerate(schema.columns):
+                        row_dict[col_name] = values[i]
+                    results.append(row_dict)
+                    
+                leaf_pgno = next_page
+                
+        return results

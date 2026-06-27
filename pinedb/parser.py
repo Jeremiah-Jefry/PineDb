@@ -1,106 +1,16 @@
-from dataclasses import dataclass
+"""
+parser.py — Layer 6: SQL Parser
+
+Tokenizer and recursive descent parser for the PineDB SQL subset.
+"""
+
 import re
+from dataclasses import dataclass
 
-class ParseError(Exception): pass
+class ParseError(Exception):
+    pass
 
-class Token:
-    def __init__(self, type: str, value: str | int | None = None):
-        self.type = type
-        self.value = value
-    def __repr__(self):
-        return f"Token({self.type}, {self.value})"
-
-KEYWORDS = {
-    'SELECT': 'KW_SELECT',
-    'FROM': 'KW_FROM',
-    'WHERE': 'KW_WHERE',
-    'INSERT': 'KW_INSERT',
-    'INTO': 'KW_INTO',
-    'VALUES': 'KW_VALUES',
-    'CREATE': 'KW_CREATE',
-    'TABLE': 'KW_TABLE',
-    'BEGIN': 'KW_BEGIN',
-    'COMMIT': 'KW_COMMIT',
-    'INT': 'KW_INT',
-    'VARCHAR': 'KW_VARCHAR'
-}
-
-class Tokenizer:
-    def __init__(self, text: str):
-        self.text = text
-        self.pos = 0
-
-    def tokenize(self) -> list[Token]:
-        tokens = []
-        while self.pos < len(self.text):
-            char = self.text[self.pos]
-
-            if char.isspace():
-                self.pos += 1
-                continue
-
-            if char == '(':
-                tokens.append(Token('LPAREN'))
-                self.pos += 1
-                continue
-            if char == ')':
-                tokens.append(Token('RPAREN'))
-                self.pos += 1
-                continue
-            if char == ',':
-                tokens.append(Token('COMMA'))
-                self.pos += 1
-                continue
-            if char == '=':
-                tokens.append(Token('EQUALS'))
-                self.pos += 1
-                continue
-            if char == '*':
-                tokens.append(Token('STAR'))
-                self.pos += 1
-                continue
-            if char == ';':
-                tokens.append(Token('SEMICOLON'))
-                self.pos += 1
-                continue
-
-            if char == "'":
-                self.pos += 1
-                start = self.pos
-                while self.pos < len(self.text) and self.text[self.pos] != "'":
-                    self.pos += 1
-                if self.pos >= len(self.text):
-                    raise ParseError("Unterminated string literal")
-                val = self.text[start:self.pos]
-                tokens.append(Token('STR_LIT', val))
-                self.pos += 1
-                continue
-
-            if char.isdigit() or (char == '-' and self.pos + 1 < len(self.text) and self.text[self.pos+1].isdigit()):
-                start = self.pos
-                self.pos += 1
-                while self.pos < len(self.text) and self.text[self.pos].isdigit():
-                    self.pos += 1
-                val = int(self.text[start:self.pos])
-                tokens.append(Token('INT_LIT', val))
-                continue
-
-            if char.isalpha() or char == '_':
-                start = self.pos
-                while self.pos < len(self.text) and (self.text[self.pos].isalnum() or self.text[self.pos] == '_'):
-                    self.pos += 1
-                val = self.text[start:self.pos]
-                val_upper = val.upper()
-                if val_upper in KEYWORDS:
-                    tokens.append(Token(KEYWORDS[val_upper]))
-                else:
-                    tokens.append(Token('IDENT', val))
-                continue
-
-            raise ParseError(f"Unexpected character: {char}")
-
-        tokens.append(Token('EOF'))
-        return tokens
+# --- AST Nodes ---
 
 @dataclass
 class CreateTable:
@@ -115,127 +25,212 @@ class InsertInto:
 @dataclass
 class Select:
     table_name: str
-    where_col: str | None = None
-    where_val: object = None
+    where_col: str | None
+    where_val: int | str | None
 
 @dataclass
-class BeginTxn: pass
+class BeginTxn:
+    pass
 
 @dataclass
-class CommitTxn: pass
+class CommitTxn:
+    pass
+
+# --- Tokenizer ---
+
+TOK_KEYWORD = 'KEYWORD'
+TOK_IDENTIFIER = 'IDENTIFIER'
+TOK_INT_LITERAL = 'INT_LITERAL'
+TOK_STRING_LITERAL = 'STRING_LITERAL'
+TOK_LPAREN = 'LPAREN'
+TOK_RPAREN = 'RPAREN'
+TOK_COMMA = 'COMMA'
+TOK_EQUALS = 'EQUALS'
+TOK_STAR = 'STAR'
+TOK_SEMICOLON = 'SEMICOLON'
+TOK_EOF = 'EOF'
+
+KEYWORDS = {
+    'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES',
+    'CREATE', 'TABLE', 'BEGIN', 'COMMIT', 'INT', 'VARCHAR'
+}
+
+TOKEN_REGEX = re.compile(
+    r'(?P<STRING_LITERAL>\'[^\']*\')|'
+    r'(?P<INT_LITERAL>-?\d+)|'
+    r'(?P<IDENTIFIER>[a-zA-Z_][a-zA-Z0-9_]*)|'
+    r'(?P<LPAREN>\()|'
+    r'(?P<RPAREN>\))|'
+    r'(?P<COMMA>,)|'
+    r'(?P<EQUALS>=)|'
+    r'(?P<STAR>\*)|'
+    r'(?P<SEMICOLON>;)|'
+    r'(?P<WS>\s+)'
+)
+
+@dataclass
+class Token:
+    type: str
+    value: str
+
+class Tokenizer:
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+        self.tokens = []
+        self._tokenize()
+
+    def _tokenize(self):
+        while self.pos < len(self.text):
+            match = TOKEN_REGEX.match(self.text, self.pos)
+            if not match:
+                raise ParseError(f"Unexpected character at position {self.pos}: {self.text[self.pos]}")
+            
+            kind = match.lastgroup
+            value = match.group(kind)
+            self.pos = match.end()
+            
+            if kind == 'WS':
+                continue
+                
+            if kind == 'IDENTIFIER' and value.upper() in KEYWORDS:
+                kind = TOK_KEYWORD
+                value = value.upper()
+                
+            if kind == 'STRING_LITERAL':
+                value = value[1:-1] # strip quotes
+                
+            if kind == 'INT_LITERAL':
+                value = int(value)
+                
+            self.tokens.append(Token(kind, value))
+            
+        self.tokens.append(Token(TOK_EOF, ''))
+
+# --- Parser ---
 
 class Parser:
     def __init__(self, text: str):
-        self.tokens = Tokenizer(text).tokenize()
+        self.tokenizer = Tokenizer(text)
+        self.tokens = self.tokenizer.tokens
         self.pos = 0
 
-    def peek(self) -> Token:
-        if self.pos < len(self.tokens):
-            return self.tokens[self.pos]
-        return Token('EOF')
+    def current(self) -> Token:
+        return self.tokens[self.pos]
 
-    def consume(self, expected_type: str) -> Token:
-        tok = self.peek()
-        if tok.type == expected_type:
-            self.pos += 1
-            return tok
-        raise ParseError(f"Expected {expected_type}, got {tok.type}")
+    def consume(self, expected_type=None, expected_value=None) -> Token:
+        tok = self.current()
+        if expected_type and tok.type != expected_type:
+            raise ParseError(f"Expected token type {expected_type}, got {tok.type}")
+        if expected_value and tok.value != expected_value:
+            raise ParseError(f"Expected '{expected_value}', got '{tok.value}'")
+        self.pos += 1
+        return tok
 
-    def parse(self) -> CreateTable | InsertInto | Select | BeginTxn | CommitTxn:
-        tok = self.peek()
-        if tok.type == 'KW_CREATE':
-            return self.parse_create_table()
-        elif tok.type == 'KW_INSERT':
-            return self.parse_insert_into()
-        elif tok.type == 'KW_SELECT':
-            return self.parse_select()
-        elif tok.type == 'KW_BEGIN':
-            self.consume('KW_BEGIN')
-            if self.peek().type == 'SEMICOLON':
-                self.consume('SEMICOLON')
-            return BeginTxn()
-        elif tok.type == 'KW_COMMIT':
-            self.consume('KW_COMMIT')
-            if self.peek().type == 'SEMICOLON':
-                self.consume('SEMICOLON')
-            return CommitTxn()
+    def peek(self, offset=1) -> Token:
+        if self.pos + offset < len(self.tokens):
+            return self.tokens[self.pos + offset]
+        return self.tokens[-1]
+
+    def parse(self):
+        tok = self.current()
+        if tok.type == TOK_KEYWORD:
+            if tok.value == 'CREATE':
+                stmt = self.parse_create_table()
+            elif tok.value == 'INSERT':
+                stmt = self.parse_insert_into()
+            elif tok.value == 'SELECT':
+                stmt = self.parse_select()
+            elif tok.value == 'BEGIN':
+                stmt = self.parse_begin()
+            elif tok.value == 'COMMIT':
+                stmt = self.parse_commit()
+            else:
+                raise ParseError(f"Unexpected keyword: {tok.value}")
         else:
-            raise ParseError(f"Unexpected statement starting with {tok.type}")
+            raise ParseError(f"Expected statement, got {tok.type}")
+            
+        if self.current().type == TOK_SEMICOLON:
+            self.consume(TOK_SEMICOLON)
+            
+        if self.current().type != TOK_EOF:
+            raise ParseError("Unexpected tokens after statement")
+            
+        return stmt
 
-    def parse_create_table(self) -> CreateTable:
-        self.consume('KW_CREATE')
-        self.consume('KW_TABLE')
-        table_name = self.consume('IDENT').value
-        self.consume('LPAREN')
-
+    def parse_create_table(self):
+        self.consume(TOK_KEYWORD, 'CREATE')
+        self.consume(TOK_KEYWORD, 'TABLE')
+        table_name = self.consume(TOK_IDENTIFIER).value
+        self.consume(TOK_LPAREN)
+        
         columns = []
         while True:
-            col_name = self.consume('IDENT').value
-            type_tok = self.peek()
-            if type_tok.type in ('KW_INT', 'KW_VARCHAR'):
-                col_type = 'INT' if type_tok.type == 'KW_INT' else 'VARCHAR'
-                self.consume(type_tok.type)
-            else:
-                raise ParseError(f"Expected INT or VARCHAR, got {type_tok.type}")
-            columns.append((str(col_name), col_type))
-
-            if self.peek().type == 'COMMA':
-                self.consume('COMMA')
+            col_name = self.consume(TOK_IDENTIFIER).value
+            col_type_tok = self.consume(TOK_KEYWORD)
+            if col_type_tok.value not in ('INT', 'VARCHAR'):
+                raise ParseError(f"Expected INT or VARCHAR, got {col_type_tok.value}")
+            columns.append((col_name, col_type_tok.value))
+            
+            if self.current().type == TOK_COMMA:
+                self.consume(TOK_COMMA)
             else:
                 break
+                
+        self.consume(TOK_RPAREN)
+        return CreateTable(table_name, columns)
 
-        self.consume('RPAREN')
-        if self.peek().type == 'SEMICOLON':
-            self.consume('SEMICOLON')
-        return CreateTable(str(table_name), columns)
-
-    def parse_insert_into(self) -> InsertInto:
-        self.consume('KW_INSERT')
-        self.consume('KW_INTO')
-        table_name = self.consume('IDENT').value
-        self.consume('KW_VALUES')
-        self.consume('LPAREN')
-
+    def parse_insert_into(self):
+        self.consume(TOK_KEYWORD, 'INSERT')
+        self.consume(TOK_KEYWORD, 'INTO')
+        table_name = self.consume(TOK_IDENTIFIER).value
+        self.consume(TOK_KEYWORD, 'VALUES')
+        self.consume(TOK_LPAREN)
+        
         values = []
         while True:
-            tok = self.peek()
-            if tok.type == 'INT_LIT':
-                values.append(self.consume('INT_LIT').value)
-            elif tok.type == 'STR_LIT':
-                values.append(self.consume('STR_LIT').value)
+            tok = self.current()
+            if tok.type in (TOK_INT_LITERAL, TOK_STRING_LITERAL):
+                values.append(tok.value)
+                self.consume()
             else:
-                raise ParseError(f"Expected INT_LIT or STR_LIT, got {tok.type}")
-
-            if self.peek().type == 'COMMA':
-                self.consume('COMMA')
+                raise ParseError(f"Expected value, got {tok.type}")
+                
+            if self.current().type == TOK_COMMA:
+                self.consume(TOK_COMMA)
             else:
                 break
+                
+        self.consume(TOK_RPAREN)
+        return InsertInto(table_name, values)
 
-        self.consume('RPAREN')
-        if self.peek().type == 'SEMICOLON':
-            self.consume('SEMICOLON')
-        return InsertInto(str(table_name), values)
-
-    def parse_select(self) -> Select:
-        self.consume('KW_SELECT')
-        self.consume('STAR')
-        self.consume('KW_FROM')
-        table_name = self.consume('IDENT').value
-
+    def parse_select(self):
+        self.consume(TOK_KEYWORD, 'SELECT')
+        self.consume(TOK_STAR)
+        self.consume(TOK_KEYWORD, 'FROM')
+        table_name = self.consume(TOK_IDENTIFIER).value
+        
         where_col = None
         where_val = None
-        if self.peek().type == 'KW_WHERE':
-            self.consume('KW_WHERE')
-            where_col = self.consume('IDENT').value
-            self.consume('EQUALS')
-            val_tok = self.peek()
-            if val_tok.type == 'INT_LIT':
-                where_val = self.consume('INT_LIT').value
-            elif val_tok.type == 'STR_LIT':
-                where_val = self.consume('STR_LIT').value
+        
+        if self.current().type == TOK_KEYWORD and self.current().value == 'WHERE':
+            self.consume(TOK_KEYWORD, 'WHERE')
+            where_col = self.consume(TOK_IDENTIFIER).value
+            self.consume(TOK_EQUALS)
+            
+            tok = self.current()
+            if tok.type in (TOK_INT_LITERAL, TOK_STRING_LITERAL):
+                where_val = tok.value
+                self.consume()
             else:
-                raise ParseError(f"Expected INT_LIT or STR_LIT in WHERE clause, got {val_tok.type}")
+                raise ParseError(f"Expected value after '=', got {tok.type}")
+                
+        return Select(table_name, where_col, where_val)
 
-        if self.peek().type == 'SEMICOLON':
-            self.consume('SEMICOLON')
-        return Select(str(table_name), where_col if where_col else None, where_val)
+    def parse_begin(self):
+        self.consume(TOK_KEYWORD, 'BEGIN')
+        return BeginTxn()
+
+    def parse_commit(self):
+        self.consume(TOK_KEYWORD, 'COMMIT')
+        return CommitTxn()

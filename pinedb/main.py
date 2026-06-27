@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""PineDB v1.0 — interactive REPL"""
+"""PineDB REPL — Layer 8"""
+
 import sys
 from pathlib import Path
+
+# Fix python path if running directly from src folder
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from pinedb.pager import Pager
 from pinedb.wal import WAL
 from pinedb.txn import TransactionManager
@@ -15,9 +20,10 @@ def main():
     pager = Pager(db_path)
     wal = WAL(db_path, pager)
 
+    # Recovery on startup — always run this first
     recovered = wal.recover(pager)
-    if recovered > 0:
-        print(f"[recovery] replayed {recovered} page(s) from WAL")
+    if recovered:
+        print(f"[recovery] replayed {recovered} pages from WAL")
 
     txn_mgr = TransactionManager(pager, wal)
     executor = Executor(pager, wal, txn_mgr)
@@ -27,30 +33,31 @@ def main():
         try:
             line = input("pinedb> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print()
             break
+            
         if not line:
             continue
+            
         if line.upper() in ("EXIT", "QUIT", "\\Q"):
             break
+            
         try:
             ast = Parser(line).parse()
             result = executor.execute(ast)
+            
             if isinstance(result, list):
-                if not result:
-                    print("(0 rows)")
                 for row in result:
                     print(row)
             else:
                 print(result)
+                
         except ParseError as e:
-            print(f"syntax error: {e}")
+            print(f"parse error: {e}")
         except Exception as e:
-            import traceback; traceback.print_exc()
-            print(f"error: {e}")
+            import traceback
+            traceback.print_exc()
 
     pager.close()
-    wal.close()
     print("bye.")
 
 if __name__ == "__main__":
