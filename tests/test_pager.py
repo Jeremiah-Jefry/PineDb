@@ -1,29 +1,42 @@
-import sys, os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import os
+import unittest
+import tempfile
+from pinedb.pager import Pager, PAGE_SIZE
 
-from src.pager import Pager
-from src.record import encode, decode
+class TestPager(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "test.db")
 
-DB_PATH = "data/test.db"
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
-def run_test():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    def test_pager_read_write(self):
+        # 1. Create pager. Allocate 100 pages.
+        pager = Pager(self.db_path)
+        page_contents = {}
 
-    pointers = []
-    pager = Pager(DB_PATH)
-    for i in range(1000):
-        ptr = pager.insert_record(encode(i, f"user{i}"))
-        pointers.append(ptr)
-    pager.close()
+        # page 0 is header. Let's allocate 100 pages.
+        # But wait, allocating starts from page_count.
+        for i in range(1, 101):
+            pgno = pager.allocate_page()
+            self.assertEqual(pgno, i)
+            payload = bytes([i % 256]) * PAGE_SIZE
+            pager.write_page(pgno, payload)
+            page_contents[pgno] = payload
 
-    # reopen — this is the part that proves it's actually disk-backed
-    pager = Pager(DB_PATH)
-    for i, (pgno, slot) in enumerate(pointers):
-        id_, name = decode(pager.read_record(pgno, slot))
-        assert id_ == i and name == f"user{i}", f"MISMATCH at {i}: got {id_}, {name}"
-    pager.close()
-    print("PASSED: 1000 records survived close/reopen")
+        # 2. Close (os.close).
+        pager.close()
 
-if __name__ == "__main__":
-    run_test()
+        # 3. Reopen same path. Read all 100 pages. Assert byte-for-byte match.
+        pager2 = Pager(self.db_path)
+        self.assertEqual(pager2.page_count(), 101) # header + 100 pages
+
+        for pgno, expected_payload in page_contents.items():
+            data = pager2.get_page(pgno)
+            self.assertEqual(data, expected_payload)
+
+        pager2.close()
+
+if __name__ == '__main__':
+    unittest.main()
