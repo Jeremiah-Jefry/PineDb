@@ -350,13 +350,3 @@ Primary sources used directly — not blog summaries, but the actual documents:
 - [The Art of Computer Programming Vol. 3](https://www-cs-faculty.stanford.edu/~knuth/taocp.html) — B+Tree split and merge algorithm correctness
 
 ---
-
-<div align="center">
-
-Built with curiosity and `os.pwrite()` by **[Your Name]**
-
-*Computer Science · [Your University] · [Year]*
-
-[GitHub](https://github.com/yourusername) · [LinkedIn](https://linkedin.com/in/yourprofile) · [Email](mailto:you@example.com)
-
-</div>
